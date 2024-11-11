@@ -1,35 +1,51 @@
 package main
 
 import (
+	"log"
 	"net/http"
-	"net/http/pprof"
 	_ "net/http/pprof"
+	"os"
 )
 
+var statsd = &StatsD{Namespace: "leftpad", SampleRate: 0.5}
+
+func init() {
+	var f, err = os.CreateTemp("", "leftpad.log")
+	if err != nil {
+		panic(err)
+	}
+	log.SetOutput(f)
+}
+
 func main() {
-	// ВАРИАНТ 1:  Всё, что вам нужно для подключения профайлера, – импортировать net/http/pprof; необходимые HTTP-обработчики будут зарегистрированы автоматически
-	//http.HandleFunc("/", hiHandler)
-	//log.Println("Сервер запущен")
-	//http.ListenAndServe(":8080", nil)
-
-	// ВАРИАНТ 2: Если ваше веб-приложение использует собственный URL-роутер, необходимо вручную зарегистрировать несколько pprof-адресов:
-	r := http.NewServeMux()
-	r.HandleFunc("/", hiHandler)
-
-	// Регистрация pprof-обработчиков
-	r.HandleFunc("/debug/pprof/", pprof.Index)
-	r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	r.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	r.HandleFunc("/debug/pprof/trace", pprof.Trace)
-
-	http.ListenAndServe(":8080", r)
-	// Вот и всё. Запустите приложение, а затем используйте pprof tool:
+	http.HandleFunc("/v1/leftpad/", timedHandler("leftpad", leftpadHandler))
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func hiHandler(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("hi"))
-}
+//func main() {
+//	// ВАРИАНТ 1:  Всё, что вам нужно для подключения профайлера, – импортировать net/http/pprof; необходимые HTTP-обработчики будут зарегистрированы автоматически
+//	//http.HandleFunc("/", hiHandler)
+//	//log.Println("Сервер запущен")
+//	//http.ListenAndServe(":8080", nil)
+//
+//	// ВАРИАНТ 2: Если ваше веб-приложение использует собственный URL-роутер, необходимо вручную зарегистрировать несколько pprof-адресов:
+//	r := http.NewServeMux()
+//	r.HandleFunc("/", hiHandler)
+//
+//	// Регистрация pprof-обработчиков
+//	r.HandleFunc("/debug/pprof/", pprof.Index)
+//	r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+//	r.HandleFunc("/debug/pprof/profile", pprof.Profile)
+//	r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+//	r.HandleFunc("/debug/pprof/trace", pprof.Trace)
+//
+//	http.ListenAndServe(":8080", r)
+//	// Вот и всё. Запустите приложение, а затем используйте pprof tool:
+//}
+
+//func hiHandler(w http.ResponseWriter, r *http.Request) {
+//	w.Write([]byte("hi"))
+//}
 
 //// Чтобы начать настройку программы Go, нам необходимо включить профилирование.
 //// Если бы код использовал поддержку бенчмаркинга пакета тестирования Go,

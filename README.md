@@ -83,7 +83,7 @@ go build
 
 # Измерение производительности
 
-Нам нужно определить, сколько запросов в секунду может обслуживать наш микросервис. Это можно сделать с помощью ab – `Apache benchmarking tool`:
+Нам нужно определить, сколько запросов в секунду может обслуживать наш микросервис. Это можно сделать с помощью ab – [Apache benchmarking tool](https://httpd.apache.org/docs/2.4/programs/ab.html):
 ```bash
 ab -k -c 8 -n 100000 "http://127.0.0.1:8080/v1/leftpad/?str=test&len=50&chr=*"
 # -k   Включить постоянное HTTP-соединение (KeepAlive)
@@ -355,3 +355,162 @@ BenchmarkLeftpad10-4             5000000           339 ns/op          64 B/op   
 BenchmarkLeftpad50-4              500000          3079 ns/op        1568 B/op         46 allocs/op
 BenchmarkStatsD-4                1000000          1516 ns/op         560 B/op         15 allocs/op
 ```
+
+# Повышение производительности
+
+## Логирование
+Хороший, но не всегда очевидный способ сделать приложение быстрее – заставить его меньше работать. 
+За исключением случаев отладки, строка `log.Printf("%s request took %v", name, elapsed)` не обязательно должна присутствовать в нашем сервисе. 
+Перед развёртыванием приложения в продакшне все ненужные логи должны быть удалены из кода или отключены. 
+Эта проблема может быть решена с помощью одной из многочисленных [библиотек для логирования](https://github.com/avelino/awesome-go#logging).
+
+
+Ещё одна важная вещь, связанная с логированием (и вообще со всеми операциями ввода-вывода), 
+– использование по возможности буферизованного ввода-вывода, что позволяет сократить количество системных вызовов. 
+Обычно нет необходимости записывать в файл каждый вызов логгера – для реализации буферизованного ввода-вывода используйте пакет [bufio](https://golang.org/pkg/bufio/). 
+Мы можем просто обернуть передаваемый логгеру объект `io.Writer` в `bufio.NewWriter` или `bufio.NewWriterSize`:
+
+```bash
+log.SetOutput(bufio.NewWriterSize(f, 1024*16))
+```
+
+## leftpad
+Снова обратимся к функции `leftpad`:
+
+```go
+func leftpad(s string, length int, char rune) string {
+for len(s) < length {
+s = string(char) + s
+}
+return s
+}
+```
+
+Конкатенация строк в цикле – не самая умная вещь, потому что каждая итерация цикла приводит к размещению в памяти новой строки. 
+Лучшим способом построения строки является использование `bytes.Buffer`:
+
+```go
+func leftpad(s string, length int, char rune) string {
+buf := bytes.Buffer{}
+for i := 0; i < length-len(s); i++ {
+buf.WriteRune(char)
+}
+buf.WriteString(s)
+return buf.String()
+}
+```
+
+В качестве альтернативы мы можем использовать `string.Repeat`, что позволяет немного сократить код:
+
+```go
+func leftpad(s string, length int, char rune) string {
+if len(s) < length {
+return strings.Repeat(string(char), length-len(s)) + s
+}
+return s
+}
+```
+
+## StatsD
+
+Следующий фрагмент кода, который нам нужно изменить, – функция `StatsD.Send`:
+
+```go
+func (s *StatsD) Send(stat string, kind string, delta float64) {
+buf := fmt.Sprintf("%s.", s.Namespace)
+trimmedStat := strings.NewReplacer(":", "_", "|", "_", "@", "_").Replace(stat)
+buf += fmt.Sprintf("%s:%s|%s", trimmedStat, delta, kind)
+if s.SampleRate != 0 && s.SampleRate < 1 {
+buf += fmt.Sprintf("|@%s", strconv.FormatFloat(s.SampleRate, 'f', -1, 64))
+}
+ioutil.Discard.Write([]byte(buf)) // TODO: Write to a socket
+}
+```
+
+Вот несколько возможных улучшений:
+
+
+1. Функция `sprintf` удобна для форматирования строк. И это прекрасно, если вы не вызываете её тысячи раз в секунду. 
+Она тратит процессорное время на разбор входящей форматированной строки и размещает в памяти новую строку при каждом вызове. 
+Мы можем заменить её на `bytes.Buffer` + `Buffer.WriteString/Buffer.WriteByte`.
+
+2. Функция не должна каждый раз создавать новый экземпляр `Replacer`, он может быть объявлен как глобальная переменная или как часть структуры `StatsD`.
+
+3. Замените `strconv.FormatFloat` на `strconv.AppendFloat` и передайте ему буфер, выделенный в стеке. Это предотвратит дополнительное выделение памяти в куче.
+
+```go
+func (s *StatsD) Send(stat string, kind string, delta float64) {
+   buf := bytes.Buffer{}
+   buf.WriteString(s.Namespace)
+   buf.WriteByte('.')
+   buf.WriteString(reservedReplacer.Replace(stat))
+   buf.WriteByte(':')
+   buf.Write(strconv.AppendFloat(make([]byte, 0, 24), delta, 'f', -1, 64))
+   buf.WriteByte('|')
+   buf.WriteString(kind)
+   if s.SampleRate != 0 && s.SampleRate < 1 {
+       buf.WriteString("|@")
+       buf.Write(strconv.AppendFloat(make([]byte, 0, 24), s.SampleRate, 'f', -1, 64))
+   }
+   buf.WriteTo(ioutil.Discard) // TODO: Write to a socket
+
+```
+Это уменьшает количество выделений памяти с 14 до одного и примерно в четыре раза ускоряет вызов Send:
+
+```
+BenchmarkStatsD-4                5000000           381 ns/op         112 B/op          1 allocs/op
+```
+
+## Измерение результата
+
+После всех оптимизаций бенчмарки показывают очень хороший прирост производительности:
+
+```
+benchmark                     old ns/op     new ns/op     delta
+BenchmarkTimedHandler-4       6511          1181          -81.86%
+BenchmarkLeftpadHandler-4     10546         3337          -68.36%
+BenchmarkLeftpad10-4          339           136           -59.88%
+BenchmarkLeftpad50-4          3079          201           -93.47%
+BenchmarkStatsD-4             1516          381           -74.87%
+
+benchmark                     old allocs     new allocs     delta
+BenchmarkTimedHandler-4       41             5              -87.80%
+BenchmarkLeftpadHandler-4     75             18             -76.00%
+BenchmarkLeftpad10-4          6              3              -50.00%
+BenchmarkLeftpad50-4          46             3              -93.48%
+BenchmarkStatsD-4             15             1              -93.33%
+
+benchmark                     old bytes     new bytes     delta
+BenchmarkTimedHandler-4       1621          448           -72.36%
+BenchmarkLeftpadHandler-4     3297          1416          -57.05%
+BenchmarkLeftpad10-4          64            24            -62.50%
+BenchmarkLeftpad50-4          1568          160           -89.80%
+BenchmarkStatsD-4             560           112           -80.00%
+```
+Примечание: для сравнения результатов я использовал [benchcmp](https://godoc.org/golang.org/x/tools/cmd/benchcmp).
+
+Запускаем `ab` ещё раз:
+
+```
+Requests per second:    32619.54 [#/sec] (mean)
+Time per request:       0.030 [ms] (mean, across all concurrent requests)
+```
+
+Теперь веб-сервис может обрабатывать около 10 000 дополнительных запросов в секунду!
+
+## Советы по оптимизации
+
+- Избегайте ненужных выделений памяти в куче.
+- Для небольших структур используйте передачу параметров по значению, а не по ссылке.
+- Заранее выделяйте память под maps и slices, если вам известен размер.
+- Не логируйте без необходимости.
+- Используйте буферизованный ввод-вывод, если выполняете много последовательных операций чтения или записи.
+- Если ваше приложение широко использует JSON, то подумайте об использовании парсеров/сериализаторов (лично я предпочитаю easyjson).
+- В горячих местах любая операция может привести к значительному снижению производительности.
+
+## Вывод
+
+Иногда узким местом может оказаться не то, что вы ожидаете. Поэтому профилирование является лучшим (а иногда – единственным) способом узнать реальную производительность вашего приложения.
+
+Вы можете найти полные исходники нашего примера на [GitHub](https://github.com/akrylysov/goprofex). 
+Первоначальная версия помечена как [v1](https://github.com/akrylysov/goprofex/tree/v1), а оптимизированная – как [v2](https://github.com/akrylysov/goprofex/tree/v2). Вот [ссылка](https://github.com/akrylysov/goprofex/compare/v1...v2) для сравнения двух версий.
